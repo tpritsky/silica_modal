@@ -20,7 +20,8 @@ from initialize_modal import app, models_volume, outputs_volume, image
 # This function runs locally to read the PDB file and pass its contents to Modal
 def run_rfdiffusion_with_local_pdb(
     name="test",
-    contigs_list=None,  # Now accepts a list of contigs
+    batch_name=None,  # Added batch_name parameter
+    contigs_list=None,
     pdb_path=None,
     iterations=50,
     symmetry="none",
@@ -29,15 +30,12 @@ def run_rfdiffusion_with_local_pdb(
     chains=None,
     add_potential=True,
     num_designs=1,
-    # Add MPNN parameters
-    num_seqs=8,
-    initial_guess=False,
-    num_recycles=1,
-    use_multimer=False,
-    rm_aa="C",
-    mpnn_sampling_temp=0.1
 ):
     """Run RFdiffusion with a local PDB file"""
+    # Generate batch name if not provided
+    if batch_name is None:
+        batch_name = f"batch_{time.strftime('%Y%m%d_%H%M%S')}"
+    
     # Use default contig if none provided
     if contigs_list is None:
         contigs_list = ["100"]
@@ -49,35 +47,35 @@ def run_rfdiffusion_with_local_pdb(
         with open(pdb_path, "r") as f:
             pdb_content = f.read()
     
-    # Create inputs for parallel execution
+    # Create inputs for parallel execution over contigs AND designs
     inputs = []
+    print(f"Running {len(contigs_list)} contigs with {num_designs} designs each...")
     for contigs in contigs_list:
-        inputs.append((
-            name,
-            contigs,
-            pdb_content,
-            iterations,
-            symmetry,
-            order,
-            hotspot,
-            chains,
-            add_potential,
-            num_designs,
-            # Add MPNN parameters
-            num_seqs,
-            initial_guess,
-            num_recycles,
-            use_multimer,
-            rm_aa,
-            mpnn_sampling_temp
-        ))
+        for design_num in range(num_designs):
+            inputs.append((
+                name,
+                batch_name,  # Pass batch_name
+                contigs,
+                pdb_content,
+                iterations,
+                symmetry,
+                order,
+                hotspot,
+                chains,
+                add_potential,
+                1,
+                design_num,
+            ))
     
     # Run in parallel using starmap and collect all results
-    print(f"Running {len(inputs)} designs in parallel...")
-    # First, fully consume the generator into a list
+    print(f"Running {len(inputs)} total designs in parallel...")
     results = list(run_rfdiffusion_test.starmap(inputs))
-    # Then create pairs with the corresponding contigs
-    return [(contigs_list[i], result) for i, result in enumerate(results)]
+    print(f"All runs completed in batch: {batch_name}")
+    print(f"Generated {len(results)} output folders:")
+    for result in results:
+        print(f"  {result['folder_name']}")
+        print(f"  MPNN args: {result['mpnn_args']}")
+    return batch_name, results  # Return both batch name and results
 
 @app.function(
     image=image,
@@ -90,6 +88,7 @@ def run_rfdiffusion_with_local_pdb(
 )
 def run_rfdiffusion_test(
     name="test",
+    batch_name="default_batch",
     contigs="100",
     pdb_content=None,
     iterations=50,
@@ -99,21 +98,31 @@ def run_rfdiffusion_test(
     chains=None,
     add_potential=True,
     num_designs=1,
-    # Add MPNN parameters
-    num_seqs=8,
-    initial_guess=False,
-    num_recycles=1,
-    use_multimer=False,
-    rm_aa="C",
-    mpnn_sampling_temp=0.1
+    design_num=0,
 ):
     """Run RFdiffusion with the specified parameters"""
     import os
     import sys
-    import random
-    import string
     import time
-    import json
+    from pathlib import Path
+    
+    # Create batch directory
+    batch_path = f"/data/outputs/{batch_name}"
+    os.makedirs(batch_path, exist_ok=True)
+    
+    # Generate unique folder name within batch
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    run_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+    folder_name = f"{name}_contig{contigs.replace('/', '-')}_design{design_num}_{timestamp}_{run_id}"
+    run_path = f"{batch_path}/{folder_name}"
+    
+    # Create run directory and subdirectories
+    os.makedirs(run_path, exist_ok=True)
+    os.makedirs(f"{run_path}/traj", exist_ok=True)
+    
+    # Ensure outputs directory exists in the volume
+    os.makedirs("/data/outputs", exist_ok=True)
+    os.makedirs("/data/outputs/traj", exist_ok=True)  # For trajectory files
     
     # Add RFdiffusion to path
     os.chdir("/data/models")
@@ -124,16 +133,8 @@ def run_rfdiffusion_test(
     from colabdesign.rf.utils import fix_contigs, fix_partial_contigs, fix_pdb
     from colabdesign.shared.protein import pdb_to_string
     
-    # Generate a unique path for outputs
-    path = name
-    while os.path.exists(f"/data/outputs/{path}_0.pdb"):
-        path = name + "_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
-    
-    full_path = f"/data/outputs/{path}"
-    os.makedirs(full_path, exist_ok=True)
-    
-    # Build options for RFdiffusion
-    opts = [f"inference.output_prefix={full_path}",
+    # Modify options to use the run folder
+    opts = [f"inference.output_prefix={run_path}/output",
             f"inference.num_designs={num_designs}"]
     
     # Sanitize inputs
@@ -152,8 +153,8 @@ def run_rfdiffusion_test(
         symmetry = None
         sym, copies = None, 1
     
-    # Parse contigs
-    contigs = contigs.replace(",", " ").replace(":", " ").split()
+    # Parse contigs - don't split on colons here
+    contigs = contigs.replace(",", " ").split()
     is_fixed, is_free = False, False
     fixed_chains = []
     
@@ -181,7 +182,7 @@ def run_rfdiffusion_test(
         
     # Process PDB if needed
     if mode in ["partial", "fixed"] and pdb_str:
-        pdb_filename = f"{full_path}/input.pdb"
+        pdb_filename = f"{run_path}/input.pdb"
         
         # Write the PDB content to a file
         with open(pdb_filename, "w") as handle:
@@ -222,7 +223,7 @@ def run_rfdiffusion_test(
     opts += ["inference.dump_pdb=True", "inference.dump_pdb_path='/tmp'"]
     
     print("Mode:", mode)
-    print("Output:", full_path)
+    print("Output:", run_path)
     print("Contigs:", contigs)
     
     opts_str = " ".join(opts)
@@ -236,9 +237,9 @@ def run_rfdiffusion_test(
     
     # Fix PDFs if necessary
     for n in range(num_designs):
-        pdbs = [f"/data/outputs/traj/{path}_{n}_pX0_traj.pdb",
-                f"/data/outputs/traj/{path}_{n}_Xt-1_traj.pdb",
-                f"{full_path}_{n}.pdb"]
+        pdbs = [f"/data/outputs/traj/{folder_name}_{n}_pX0_traj.pdb",
+                f"/data/outputs/traj/{folder_name}_{n}_Xt-1_traj.pdb",
+                f"{run_path}_{n}.pdb"]
         for pdb_file in pdbs:
             if os.path.exists(pdb_file):
                 with open(pdb_file, "r") as handle:
@@ -246,34 +247,55 @@ def run_rfdiffusion_test(
                 with open(pdb_file, "w") as handle:
                     handle.write(fix_pdb(pdb_str, contigs))
     
-    # After RFdiffusion completes successfully
+    # After processing, ensure all files are synced and committed to the volume
+    os.system("sync")
+    outputs_volume.commit()
+    
+    # After RFdiffusion completes successfully, run MPNN
     if result == 0:
-        # Save the output paths for later MPNN processing
-        output_files = []
-        for n in range(num_designs):
-            pdb_file = f"{full_path}_{n}.pdb"
-            if os.path.exists(pdb_file):
-                output_files.append(pdb_file)
+        mpnn_args = {
+            "pdb": f"{run_path}/output_0.pdb",
+            "loc": run_path,
+            "contig": contigs,
+            "copies": copies,
+            "num_seqs": 8,
+            "num_recycles": 1,
+            "rm_aa": "C",
+            "mpnn_sampling_temp": 0.1,
+            "num_designs": 1
+        }
+        
+        print("\nRunning MPNN on output structure...")
+        print(f"Using PDB file: {mpnn_args['pdb']}")
+        mpnn_result = run_mpnn.remote(
+            mpnn_args=mpnn_args,
+            initial_guess=False,
+            use_multimer=False
+        )
         
         return {
+            "batch_path": batch_path,
+            "folder_name": folder_name,
             "result": "success",
             "rfdiffusion_cmd": cmd,
-            "output_path": full_path,
-            "output_files": output_files,
+            "output_path": run_path,
             "runtime_seconds": end_time - start_time,
             "contigs": contigs,
             "copies": copies,
-            "path": path
+            "mpnn_args": mpnn_args,
+            "mpnn_result": mpnn_result
         }
     
     return {
+        "batch_path": batch_path,
+        "folder_name": folder_name,
         "result": "failed",
         "command": cmd,
-        "output_path": full_path,
+        "output_path": run_path,
         "runtime_seconds": end_time - start_time,
         "contigs": contigs,
         "copies": copies,
-        "path": path
+        "mpnn_args": None
     }
 
 @app.function(
@@ -286,67 +308,57 @@ def run_rfdiffusion_test(
     timeout=14400,
 )
 def run_mpnn(
-    pdb_path: str,
-    output_dir: str,
-    contigs: str,
-    copies: int = 1,
-    num_seqs: int = 8,
+    mpnn_args: dict,
     initial_guess: bool = False,
-    num_recycles: int = 1,
     use_multimer: bool = False,
-    rm_aa: str = "C",
-    mpnn_sampling_temp: float = 0.1,
-    num_designs: int = 1
 ):
-    """Run ProteinMPNN on a previously generated structure"""
+    """Run ProteinMPNN on the output structure"""
     import os
     import time
-    from pathlib import Path
     
     # First check if params are initialized
     if not os.path.isfile("/data/models/params/done.txt"):
-        print("Waiting for AlphaFold params...")
+        print("downloading AlphaFold params...")
         while not os.path.isfile("/data/models/params/done.txt"):
             time.sleep(5)
-
-    # Ensure paths are absolute
-    pdb_path = str(Path(pdb_path).absolute())
-    output_dir = str(Path(output_dir).absolute())
-
-    mpnn_opts = [
-        f"--pdb={pdb_path}",
-        f"--loc={output_dir}",
-        f"--contig={contigs}",
-        f"--copies={copies}",
-        f"--num_seqs={num_seqs}",
-        f"--num_recycles={num_recycles}",
-        f"--rm_aa={rm_aa}",
-        f"--mpnn_sampling_temp={mpnn_sampling_temp}",
-        f"--num_designs={num_designs}"
+    
+    # Build command line options
+    opts = [
+        f"--pdb={mpnn_args['pdb']}",
+        f"--loc={mpnn_args['loc']}",
+        f"--contig={':'.join(mpnn_args['contig']) if isinstance(mpnn_args['contig'], list) else mpnn_args['contig']}",
+        f"--copies={mpnn_args['copies']}",
+        f"--num_seqs={mpnn_args['num_seqs']}",
+        f"--num_recycles={mpnn_args['num_recycles']}",
+        f"--rm_aa={mpnn_args['rm_aa']}",
+        f"--mpnn_sampling_temp={mpnn_args['mpnn_sampling_temp']}",
+        f"--num_designs={mpnn_args['num_designs']}"
     ]
+    
     if initial_guess:
-        mpnn_opts.append("--initial_guess")
+        opts.append("--initial_guess")
     if use_multimer:
-        mpnn_opts.append("--use_multimer")
-        
-    # Use the installed ColabDesign package
-    mpnn_cmd = f"python -m colabdesign.rf.designability_test {' '.join(mpnn_opts)}"
-    print(f"Running command: {mpnn_cmd}")
+        opts.append("--use_multimer")
+    
+    opts_str = ' '.join(opts)
+    cmd = f"python -m colabdesign.rf.designability_test {opts_str}"
+    
+    print(f"Running MPNN command: {cmd}")
     start_time = time.time()
-    mpnn_result = os.system(mpnn_cmd)
+    result = os.system(cmd)
     end_time = time.time()
     
     return {
-        "result": "success" if mpnn_result == 0 else "failed",
-        "mpnn_cmd": mpnn_cmd,
-        "runtime_seconds": end_time - start_time,
-        "mpnn_result": mpnn_result
+        "result": "success" if result == 0 else "failed",
+        "command": cmd,
+        "runtime_seconds": end_time - start_time
     }
 
 @app.local_entrypoint()
 def main(
     name: str = "test",
-    contigs: str = "100",  # Accepts a comma-separated list of contigs
+    batch_name: str = None,  # Added batch_name parameter
+    contigs: str = "100",
     pdb: str = None,
     iterations: int = 50,
     symmetry: str = "none",
@@ -357,13 +369,6 @@ def main(
     add_potential: bool = True,
     gpu_type: str = "A100",
     timeout_hours: float = 4.0,
-    # Add MPNN parameters
-    num_seqs: int = 8,
-    initial_guess: bool = False,
-    num_recycles: int = 1,
-    use_multimer: bool = False,
-    rm_aa: str = "C",
-    mpnn_sampling_temp: float = 0.1,
 ):
     """Modal entrypoint to run the RFdiffusion test"""
     # First make sure the volumes are initialized
@@ -372,18 +377,21 @@ def main(
     print("Ensuring volumes are initialized...")
     initialize_volumes.remote()
     
-    # Parse contigs list
+    # Parse contigs list - split only on commas, preserve the rest of the structure
     contigs_list = [c.strip() for c in contigs.split(",") if c.strip()]
-    print(f"Running RFdiffusion test with {len(contigs_list)} contigs: {contigs_list}")
+    print(f"Running RFdiffusion test with {len(contigs_list)} contigs:")
+    for i, contig in enumerate(contigs_list):
+        print(f"{i+1}. {contig}")
     
     # Configure the GPU and timeout dynamically
     timeout_seconds = int(timeout_hours * 3600)
     run_rfdiffusion_test.gpu = gpu_type
     run_rfdiffusion_test.timeout = timeout_seconds
     
-    # Run all contigs in parallel
-    results = run_rfdiffusion_with_local_pdb(
+    # Run all designs in parallel
+    batch_name, results = run_rfdiffusion_with_local_pdb(
         name=name,
+        batch_name=batch_name,
         contigs_list=contigs_list,
         pdb_path=pdb,
         iterations=iterations,
@@ -393,38 +401,10 @@ def main(
         chains=chains,
         add_potential=add_potential,
         num_designs=num_designs,
-        # Add MPNN parameters
-        num_seqs=num_seqs,
-        initial_guess=initial_guess,
-        num_recycles=num_recycles,
-        use_multimer=use_multimer,
-        rm_aa=rm_aa,
-        mpnn_sampling_temp=mpnn_sampling_temp,
     )
     
-    print("\nAll runs completed:")
-    for contigs, result in results:
-        print(f"Contigs: {contigs}")
-        print(f"  Result: {result['result']}")
-        print(f"  Output: {result['output_path']}")
-        print(f"  Runtime: {result['runtime_seconds']:.2f} seconds")
-        print()
-
-    # After getting results from RFdiffusion
-    for contigs, result in results:
-        if result['result'] == 'success':
-            for pdb_file in result['output_files']:
-                mpnn_result = run_mpnn.remote(
-                    pdb_path=pdb_file,
-                    output_dir=result['output_path'],
-                    contigs=":".join(result['contigs']),
-                    copies=result['copies'],
-                    num_seqs=num_seqs,
-                    initial_guess=initial_guess,
-                    num_recycles=num_recycles,
-                    use_multimer=use_multimer,
-                    rm_aa=rm_aa,
-                    mpnn_sampling_temp=mpnn_sampling_temp,
-                    num_designs=num_designs
-                )
-                print(f"MPNN result for {pdb_file}: {mpnn_result}")
+    print(f"\nAll runs completed in batch: {batch_name}")
+    print(f"Generated {len(results)} output folders:")
+    for result in results:
+        print(f"  {result['folder_name']}")
+        print(f"  MPNN args: {result['mpnn_args']}")
